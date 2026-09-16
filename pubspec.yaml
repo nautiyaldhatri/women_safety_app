@@ -33,6 +33,7 @@ dev_dependencies:
 flutter:
   assets:
     - assets/models/
+    - assets/models/distress_classifier.tflite
     - assets/sounds/alarm.wav
 
   uses-material-design: true
