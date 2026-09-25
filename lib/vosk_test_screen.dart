@@ -16,8 +16,6 @@ class _VoskTestScreenState extends State<VoskTestScreen> {
   final _vosk = VoskFlutterPlugin.instance();
   final _modelLoader = ModelLoader();
 
-  Model? _model;
-  Recognizer? _recognizer;
   SpeechService? _speechService;
 
   String _liveText = '';
@@ -26,7 +24,8 @@ class _VoskTestScreenState extends State<VoskTestScreen> {
 
   static const _sampleRate = 16000;
   // Change this to the Hindi zip filename to test that model instead.
-  static const _modelAssetPath = 'assets/models/vosk-model-small-en-us-0.15.zip';
+  static const _modelAssetPath =
+      'assets/models/vosk-model-small-en-us-0.15.zip';
 
   @override
   void initState() {
@@ -73,8 +72,6 @@ class _VoskTestScreenState extends State<VoskTestScreen> {
       });
 
       setState(() {
-        _model = model;
-        _recognizer = recognizer;
         _speechService = speechService;
         _status = 'Ready';
       });
@@ -114,7 +111,9 @@ class _VoskTestScreenState extends State<VoskTestScreen> {
             const SizedBox(height: 24),
             ElevatedButton(
               onPressed: _speechService == null ? null : _toggleListening,
-              child: Text(_recognitionStarted ? 'Stop Listening' : 'Start Listening'),
+              child: Text(
+                _recognitionStarted ? 'Stop Listening' : 'Start Listening',
+              ),
             ),
             const SizedBox(height: 32),
             const Text('Heard:', style: TextStyle(fontWeight: FontWeight.bold)),
