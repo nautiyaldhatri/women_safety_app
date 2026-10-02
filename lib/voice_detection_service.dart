@@ -1,49 +1,55 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
+import 'package:record/record.dart';
 import 'package:vosk_flutter/vosk_flutter.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
 
-/// Callback fired when a real distress trigger is confirmed.
-/// [detectedPhrase] is the exact text that triggered it.
-/// [viaWakeName] is true if it came through the wake-name -> active-window
-/// path, false if it was a direct distress-phrase match (no wake name said).
-typedef SosTriggerCallback =
-    void Function(String detectedPhrase, bool viaWakeName);
+typedef SosTriggerCallback = void Function(String detectedPhrase, bool viaWakeName);
 
-/// Handles continuous voice detection: listens for the user's chosen wake
-/// name, opens a short active-listening window, and checks for distress
-/// phrases either within that window or as a direct (stricter) match.
+/// Voice detection service - manually captures microphone audio and feeds
+/// the SAME audio into two parallel paths:
+///   1. Vosk recognizer -> text -> wake name / distress phrase matching
+///   2. YAMNet -> embeddings -> distress classifier -> tone confidence score
+/// A trigger fires on either a confirmed text match, OR a high-confidence
+/// tone match (as an extra layer alongside the existing text-based logic).
 class VoiceDetectionService {
   final _vosk = VoskFlutterPlugin.instance();
   final _modelLoader = ModelLoader();
 
-  SpeechService? _speechService;
-  StreamSubscription? _resultSubscription;
-  Timer? _activeWindowTimer;
+  Recognizer? _recognizer;
+  Interpreter? _yamnetInterpreter;
+  Interpreter? _classifierInterpreter;
+  final AudioRecorder _audioRecorder = AudioRecorder();
 
+  StreamSubscription<Uint8List>? _micSubscription;
+  Timer? _activeWindowTimer;
   bool _activeWindowOpen = false;
 
-  static const _sampleRate = 16000;
-  static const _activeWindowDuration = Duration(seconds: 10);
+  // Rolling buffer for the tone-classifier path. YAMNet expects ~1 second
+  // of 16kHz mono float audio per inference.
+  final List<int> _toneBufferBytes = [];
+  static const int _sampleRate = 16000;
+  static const int _bytesPerSample = 2; // 16-bit PCM
+  static const int _toneWindowBytes = _sampleRate * _bytesPerSample; // ~1 second
 
-  // Distress phrases, one list per supported language.
+  static const _activeWindowDuration = Duration(seconds: 10);
+  static const double _toneConfidenceThreshold = 0.85; // stricter than text-only
+
   static const Map<String, List<String>> _distressPhrasesByLang = {
     'en': ['help me', 'help'],
     'hi': ['bachao mujhe', 'bachao'],
   };
 
-  // Wake names - same list regardless of language, since these are proper
-  // nouns the user picked from the preset list.
   static const List<String> _wakeNames = [
-    'kavach',
-    'sakhi',
-    'durga',
-    'shakti',
-    'diya',
-    'amba',
+    'kavach', 'sakhi', 'durga', 'shakti', 'diya', 'amba',
   ];
 
   final SosTriggerCallback onSosTriggered;
-  final String languageCode; // 'en' or 'hi'
+  final String languageCode;
 
   VoiceDetectionService({
     required this.onSosTriggered,
@@ -53,36 +59,79 @@ class VoiceDetectionService {
   List<String> get _distressPhrases =>
       _distressPhrasesByLang[languageCode] ?? _distressPhrasesByLang['en']!;
 
-  String get _modelAssetPath => languageCode == 'hi'
+  String get _voskModelAssetPath => languageCode == 'hi'
       ? 'assets/models/vosk-model-small-hi-0.22.zip'
       : 'assets/models/vosk-model-small-en-us-0.15.zip';
 
-  /// Loads the model and starts continuous background listening.
-  /// Call this once, e.g. from your app's startup / home screen initState.
   Future<void> start() async {
-    final modelPath = await _modelLoader.loadFromAssets(_modelAssetPath);
+    // --- Set up Vosk (text path) ---
+    final modelPath = await _modelLoader.loadFromAssets(_voskModelAssetPath);
     final model = await _vosk.createModel(modelPath);
-    final recognizer = await _vosk.createRecognizer(
-      model: model,
+    _recognizer = await _vosk.createRecognizer(model: model, sampleRate: _sampleRate);
+
+    // --- Set up YAMNet + classifier (tone path) ---
+    await _loadToneModels();
+    print('✅ YAMNet + classifier models loaded successfully');
+
+    // --- Start manual mic capture, feeding both paths ---
+    if (!await _audioRecorder.hasPermission()) {
+      throw Exception('Microphone permission not granted');
+    }
+
+    final stream = await _audioRecorder.startStream(const RecordConfig(
+      encoder: AudioEncoder.pcm16bits,
       sampleRate: _sampleRate,
-    );
-    final speechService = await _vosk.initSpeechService(recognizer);
+      numChannels: 1,
+    ));
 
-    _resultSubscription = speechService.onResult().listen(_handleResult);
-
-    _speechService = speechService;
-
-    await speechService.start();
+    _micSubscription = stream.listen(_onAudioChunk);
   }
 
-  void _handleResult(String resultJson) {
+  /// Copies bundled .tflite assets to a real file path (interpreters need
+  /// an actual file, not an asset bundle reference) and loads them.
+  Future<void> _loadToneModels() async {
+    final yamnetPath = await _copyAssetToFile('assets/models/yamnet.tflite', 'yamnet.tflite');
+    final classifierPath = await _copyAssetToFile(
+        'assets/models/distress_classifier.tflite', 'distress_classifier.tflite');
+
+    _yamnetInterpreter = Interpreter.fromFile(File(yamnetPath));
+    _classifierInterpreter = Interpreter.fromFile(File(classifierPath));
+  }
+
+  Future<String> _copyAssetToFile(String assetPath, String filename) async {
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/$filename');
+    if (!await file.exists()) {
+      final bytes = await rootBundle.load(assetPath);
+      await file.writeAsBytes(bytes.buffer.asUint8List());
+    }
+    return file.path;
+  }
+
+  void _onAudioChunk(Uint8List chunk) {
+    // --- Feed Vosk (text path) ---
+    _recognizer?.acceptWaveformBytes(chunk).then((resultReady) async {
+      if (resultReady) {
+        final result = await _recognizer!.getResult();
+        _handleTextResult(result);
+      }
+    });
+
+    // --- Feed the tone-classifier rolling buffer ---
+    _toneBufferBytes.addAll(chunk);
+    if (_toneBufferBytes.length >= _toneWindowBytes) {
+      final windowBytes = Uint8List.fromList(_toneBufferBytes.sublist(0, _toneWindowBytes));
+      _toneBufferBytes.removeRange(0, _toneWindowBytes);
+      _runToneClassifier(windowBytes);
+    }
+  }
+
+  void _handleTextResult(String resultJson) {
     final decoded = jsonDecode(resultJson);
     final text = (decoded['text'] as String?)?.toLowerCase().trim() ?? '';
     if (text.isEmpty) return;
 
     if (_activeWindowOpen) {
-      // We're in the post-wake-name window: check for a distress phrase
-      // with a looser threshold (any distress phrase anywhere in the text).
       for (final phrase in _distressPhrases) {
         if (text.contains(phrase)) {
           _closeActiveWindow();
@@ -90,11 +139,9 @@ class VoiceDetectionService {
           return;
         }
       }
-      // Didn't match this time, keep the window open until it expires.
       return;
     }
 
-    // Not in an active window: check for the wake name first.
     for (final name in _wakeNames) {
       if (text.contains(name)) {
         _openActiveWindow();
@@ -102,15 +149,50 @@ class VoiceDetectionService {
       }
     }
 
-    // No wake name heard: fall back to a direct, stricter distress-phrase
-    // check. "Stricter" here means the phrase must be the ENTIRE
-    // recognized utterance, not just contained somewhere in a longer
-    // sentence - reduces accidental triggers from casual conversation.
     for (final phrase in _distressPhrases) {
       if (text == phrase) {
         onSosTriggered(phrase, false);
         return;
       }
+    }
+  }
+
+  void _runToneClassifier(Uint8List pcmBytes) {
+    if (_yamnetInterpreter == null || _classifierInterpreter == null) return;
+
+    try {
+      // Convert 16-bit PCM bytes to normalized float32 [-1.0, 1.0]
+      final byteData = ByteData.sublistView(pcmBytes);
+      final sampleCount = pcmBytes.length ~/ 2;
+      final waveform = Float32List(sampleCount);
+      for (var i = 0; i < sampleCount; i++) {
+        final sample = byteData.getInt16(i * 2, Endian.little);
+        waveform[i] = sample / 32768.0;
+      }
+
+      // Run YAMNet: input is the waveform, output includes embeddings.
+      // NOTE: YAMNet's output tensor shapes can be dynamic (frame count
+      // depends on input length) - this may need adjustment once tested
+      // on a real device. Check output tensor shape via
+      // _yamnetInterpreter!.getOutputTensors() while debugging if this
+      // doesn't run cleanly on first try.
+      final embeddingOutput = List.generate(1, (_) => List.filled(1024, 0.0));
+      _yamnetInterpreter!.run(waveform, embeddingOutput);
+
+      // Run our classifier on the embedding
+      final input = [embeddingOutput[0]];
+      final output = List.generate(1, (_) => List.filled(1, 0.0));
+      _classifierInterpreter!.run(input, output);
+
+      final distressScore = output[0][0];
+      print('🎤 Tone score: ${distressScore.toStringAsFixed(3)}');
+      if (distressScore >= _toneConfidenceThreshold) {
+        onSosTriggered('distress tone detected', false);
+      }
+    } catch (e) {
+      // Tone classification is an enhancement layer - if it fails, text
+      // detection still works independently. Log and continue.
+      print('Tone classifier error: $e');
     }
   }
 
@@ -126,10 +208,12 @@ class VoiceDetectionService {
     _activeWindowTimer = null;
   }
 
-  /// Call this when the app is closing or voice detection should stop.
   Future<void> dispose() async {
     _activeWindowTimer?.cancel();
-    await _resultSubscription?.cancel();
-    await _speechService?.dispose();
+    await _micSubscription?.cancel();
+    await _audioRecorder.stop();
+    _audioRecorder.dispose();
+    _yamnetInterpreter?.close();
+    _classifierInterpreter?.close();
   }
 }

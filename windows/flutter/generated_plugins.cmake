@@ -5,15 +5,17 @@
 list(APPEND FLUTTER_PLUGIN_LIST
   app_links
   audioplayers_windows
+  connectivity_plus
   geolocator_windows
   local_auth_windows
   permission_handler_windows
+  record_windows
   url_launcher_windows
-  vosk_flutter
 )
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST
   jni
+  tflite_flutter
 )
 
 set(PLUGIN_BUNDLED_LIBRARIES)

@@ -1,24 +1,35 @@
 name: women_safety_app
-description: "A new Flutter project."
+description: "AI-Powered Women Safety App"
 publish_to: 'none'
 
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.11.5
+  sdk: ^3.5.0
 
 dependencies:
   flutter:
     sdk: flutter
-  supabase_flutter: ^2.0.0
-  http: ^0.13.6
+
+  # Backend & Network
+  supabase_flutter: ^2.8.0
+  http: ^1.2.0
+
+  # Location & Connectivity (For SOS & Offline SMS)
   geolocator: ^13.0.1
   geolocator_android: ^4.6.1
-  vosk_flutter: ^0.3.48
+  connectivity_plus: ^6.1.0
+  url_launcher: ^6.3.1
+  shared_preferences: ^2.3.4
 
-
-  permission_handler: ^10.2.0
+  # AI / ML & Audio
+  tflite_flutter: ^0.10.4
+  record: ^6.0.0
   audioplayers: ^6.0.0
+  path_provider: ^2.1.0
+
+  # Device & Security Features
+  permission_handler: ^11.3.1
   local_auth: ^2.3.0
   flutter_local_notifications: ^17.0.0
 
@@ -27,15 +38,14 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^6.0.0
+  flutter_lints: ^5.0.0
 
 flutter:
-  assets:
-    - assets/models/
-    - assets/sounds/alarm.wav
-
   uses-material-design: true
 
-dependency_overrides:
-  permission_handler: ^11.3.0
-  permission_handler_android: ^12.0.13
+  assets:
+    - assets/models/vosk-model-small-en-us-0.15.zip
+    - assets/models/vosk-model-small-hi-0.22.zip
+    - assets/models/yamnet.tflite
+    - assets/models/distress_classifier.tflite
+    - assets/sounds/alarm.wav
