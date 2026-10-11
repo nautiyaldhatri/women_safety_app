@@ -14,6 +14,8 @@ import 'package:sensors_plus/sensors_plus.dart';
 
 import 'contacts_screen.dart';
 import 'ride_safety_screen.dart';
+import 'map_screen.dart';
+import 'community_screen.dart';
 import 'voice_detection_service.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -26,10 +28,14 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
   String status = "Press button, SHAKE phone, or SCREAM in emergency";
   Timer? countdownTimer;
+  Timer? liveLocationTimer;
+
   int secondsLeft = 30;
   bool isCountingDown = false;
   bool isSending = false;
-  bool isMlActive = false;
+  bool isAlertActive = false;
+  bool isMlActive = true;
+  String? activeAlertId;
 
   final LocalAuthentication _auth = LocalAuthentication();
   late VoiceDetectionService _mlVoiceService;
@@ -44,29 +50,26 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   void initState() {
     super.initState();
 
-    // 1. SOS Button Pulse Animation
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 2),
     )..repeat(reverse: true);
 
-    // 2. Accelerometer Shake Gesture
     _initShakeGesture();
-
-    // 3. Start TFLite ML Voice Detection (YAMNet + Distress Classifier)
     _initMlVoiceAssistant();
   }
 
+  // ===================== SHAKE GESTURE =====================
   void _initShakeGesture() {
     _accelerometerSubscription = accelerometerEventStream().listen((AccelerometerEvent event) {
       double gForce = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
 
-      // Threshold set to 22.0 (requires an intentional, firm physical shake)
+      // Requires a firm intentional shake
       if (gForce > 22.0) {
         final now = DateTime.now();
         if (now.difference(_lastShakeTime).inSeconds > 4) {
           _lastShakeTime = now;
-          if (!isCountingDown && !isSending) {
+          if (!isCountingDown && !isSending && !isAlertActive) {
             _startCountdownWithReason("Physical Phone Shake");
           }
         }
@@ -74,10 +77,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     });
   }
 
+  // ===================== ML VOICE / SCREAM =====================
   Future<void> _initMlVoiceAssistant() async {
     _mlVoiceService = VoiceDetectionService(
       onSosTriggered: (reason) {
-        if (!isCountingDown && !isSending) {
+        if (!isCountingDown && !isSending && !isAlertActive) {
           print('🚨 ML Model Triggered SOS: $reason');
           _startCountdownWithReason(reason);
         }
@@ -92,15 +96,33 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
+  void _toggleMlEngine() {
+    setState(() {
+      isMlActive = !isMlActive;
+      _mlVoiceService.isEnabled = isMlActive;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(isMlActive
+            ? '🟢 ML Sound Detection Enabled'
+            : '🔴 ML Sound Detection Disabled'),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _accelerometerSubscription?.cancel();
     _mlVoiceService.dispose();
     countdownTimer?.cancel();
+    liveLocationTimer?.cancel();
     _pulseController.dispose();
     super.dispose();
   }
 
+  // ===================== COUNTDOWN =====================
   void _startCountdownWithReason(String reason) {
     setState(() {
       isCountingDown = true;
@@ -127,7 +149,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   Future<void> _cancelCountdown() async {
     try {
-      bool canAuthenticate = await _auth.canCheckBiometrics || await _auth.isDeviceSupported();
+      bool canAuthenticate =
+          await _auth.canCheckBiometrics || await _auth.isDeviceSupported();
 
       if (!canAuthenticate) {
         _forceCancelCountdown();
@@ -167,6 +190,63 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     });
   }
 
+  // ===================== I'M SAFE / RESOLVE =====================
+  Future<void> _resolveAlert() async {
+    try {
+      bool canAuthenticate =
+          await _auth.canCheckBiometrics || await _auth.isDeviceSupported();
+
+      if (canAuthenticate) {
+        bool authenticated = await _auth.authenticate(
+          localizedReason: 'Scan Fingerprint/PIN to mark yourself SAFE',
+          options: const AuthenticationOptions(
+            stickyAuth: true,
+            biometricOnly: false,
+          ),
+        );
+        if (!authenticated) return;
+      }
+
+      setState(() {
+        status = "Resolving active alert...";
+      });
+
+      liveLocationTimer?.cancel();
+
+      final session = Supabase.instance.client.auth.currentSession;
+      if (activeAlertId != null) {
+        await http.post(
+          Uri.parse(
+              'https://msgzotmxqqurofawnjcd.supabase.co/functions/v1/resolve-alert'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ${session?.accessToken}',
+            'apikey': 'sb_publishable_q2Giprn7HQfEk0VnI5UjGg_KPQ06x6K',
+          },
+          body: jsonEncode({'alert_id': activeAlertId}),
+        );
+      }
+
+      setState(() {
+        isAlertActive = false;
+        activeAlertId = null;
+        status = "✅ Alert Resolved. You are marked Safe.";
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('✅ Guardians notified that you are SAFE!'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      setState(() => status = "❌ Error resolving alert: $e");
+    }
+  }
+
+  // ===================== LOCATION =====================
   Future<Position?> _getFastLocation() async {
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
@@ -195,6 +275,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
+  // ===================== SEND SOS =====================
   Future<void> _sendSOS() async {
     setState(() {
       isSending = true;
@@ -213,7 +294,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       }
 
       final connectivityResult = await Connectivity().checkConnectivity();
-      final bool isOnline = !connectivityResult.contains(ConnectivityResult.none);
+      final bool isOnline =
+      !connectivityResult.contains(ConnectivityResult.none);
 
       if (isOnline) {
         setState(() => status = "Sending Cloud SOS alert...");
@@ -223,7 +305,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
         final response = await http
             .post(
-          Uri.parse('https://msgzotmxqqurofawnjcd.supabase.co/functions/v1/send-alert'),
+          Uri.parse(
+              'https://msgzotmxqqurofawnjcd.supabase.co/functions/v1/send-alert'),
           headers: {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ${session?.accessToken}',
@@ -238,7 +321,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             .timeout(const Duration(seconds: 15));
 
         if (response.statusCode == 200) {
-          setState(() => status = "🚨 Cloud SOS Alert sent successfully!");
+          final resData = jsonDecode(response.body);
+          activeAlertId = resData['alert_id']?.toString();
+
+          setState(() {
+            isAlertActive = true;
+            status = "🚨 EMERGENCY ACTIVE: Live Location Streaming On!";
+          });
+
+          _startLiveLocationUpdates();
         } else {
           await _sendOfflineSMS(position);
         }
@@ -252,6 +343,41 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
+  void _startLiveLocationUpdates() {
+    liveLocationTimer?.cancel();
+    liveLocationTimer = Timer.periodic(const Duration(seconds: 12), (timer) async {
+      if (!isAlertActive || activeAlertId == null) {
+        timer.cancel();
+        return;
+      }
+
+      try {
+        Position? position = await _getFastLocation();
+        if (position != null) {
+          final session = Supabase.instance.client.auth.currentSession;
+          await http.post(
+            Uri.parse(
+                'https://msgzotmxqqurofawnjcd.supabase.co/functions/v1/update-location'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ${session?.accessToken}',
+              'apikey': 'sb_publishable_q2Giprn7HQfEk0VnI5UjGg_KPQ06x6K',
+            },
+            body: jsonEncode({
+              'alert_id': activeAlertId,
+              'latitude': position.latitude,
+              'longitude': position.longitude,
+            }),
+          );
+          print(
+              "📡 Live Location Streamed: ${position.latitude}, ${position.longitude}");
+        }
+      } catch (e) {
+        print("Live Location Stream error: $e");
+      }
+    });
+  }
+
   Future<void> _sendOfflineSMS(Position position) async {
     setState(() => status = "Offline: Requesting SMS permission...");
 
@@ -262,10 +388,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
 
     final prefs = await SharedPreferences.getInstance();
-    final cachedJson = prefs.getStringList('cached_emergency_contacts') ?? [];
+    final cachedJson =
+        prefs.getStringList('cached_emergency_contacts') ?? [];
 
     if (cachedJson.isEmpty) {
-      setState(() => status = "❌ No emergency contacts cached! Add contacts first.");
+      setState(() =>
+      status = "❌ No emergency contacts cached! Add contacts first.");
       return;
     }
 
@@ -273,13 +401,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         .map((c) => jsonDecode(c) as Map<String, dynamic>)
         .toList();
 
-    final String mapsLink = 'https://maps.google.com/?q=${position.latitude},${position.longitude}';
-    final String message = 'EMERGENCY SOS! I need help immediately. My Location: $mapsLink';
+    final String mapsLink =
+        'https://maps.google.com/?q=${position.latitude},${position.longitude}';
+    final String message =
+        'EMERGENCY SOS! I need help immediately. My Location: $mapsLink';
 
     int sentCount = 0;
 
     for (var contact in contacts) {
-      String phone = (contact['contact_phone'] ?? contact['phone'])?.toString() ?? '';
+      String phone =
+          (contact['contact_phone'] ?? contact['phone'])?.toString() ?? '';
       if (phone.isNotEmpty) {
         try {
           await _smsChannel.invokeMethod('sendDirectSms', {
@@ -294,15 +425,23 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
 
     if (sentCount > 0) {
-      setState(() => status = "🚨 Direct SMS sent to $sentCount emergency contacts!");
+      setState(() {
+        isAlertActive = true;
+        status = "🚨 Direct SMS sent to $sentCount emergency contacts!";
+      });
     } else {
       setState(() => status = "❌ Failed to send direct SMS.");
     }
   }
 
+  // ===================== BUILD (WITH BOTTOM NAV BAR FIX) =====================
   @override
   Widget build(BuildContext context) {
-    bool isEmergency = isCountingDown || status.contains("ALERT") || status.contains("Broadcasted");
+    bool isEmergency =
+        isCountingDown || isAlertActive || status.contains("ALERT");
+
+    // ★★★ Bottom system navigation bar inset ★★★
+    final double bottomInset = MediaQuery.of(context).viewPadding.bottom;
 
     return Scaffold(
       backgroundColor: const Color(0xFF12121A),
@@ -343,10 +482,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         ],
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(20.0),
+        // Extra bottom padding so content never sits under the 3-button nav bar
+        padding: EdgeInsets.fromLTRB(20, 20, 20, 24 + bottomInset),
         child: Column(
           children: [
-            // STATUS BADGE CARD
+            // ===== STATUS BADGE =====
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
               decoration: BoxDecoration(
@@ -362,7 +502,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               child: Row(
                 children: [
                   Icon(
-                    isEmergency ? Icons.warning_amber_rounded : Icons.check_circle_outline,
+                    isEmergency
+                        ? Icons.warning_amber_rounded
+                        : Icons.check_circle_outline,
                     color: isEmergency ? Colors.redAccent : Colors.greenAccent,
                     size: 28,
                   ),
@@ -371,7 +513,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     child: Text(
                       status,
                       style: TextStyle(
-                        color: isEmergency ? Colors.redAccent : Colors.greenAccent,
+                        color: isEmergency
+                            ? Colors.redAccent
+                            : Colors.greenAccent,
                         fontSize: 14,
                         fontWeight: FontWeight.w600,
                       ),
@@ -383,77 +527,90 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
             const SizedBox(height: 16),
 
-            // TFLite ML MODEL STATUS CARD
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1E1E2C),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: isMlActive ? Colors.greenAccent.withValues(alpha: 0.5) : Colors.white10,
-                ),
-              ),
-              child: Row(
-                children: [
-                  CircleAvatar(
-                    radius: 22,
-                    backgroundColor: isMlActive
-                        ? Colors.greenAccent.withValues(alpha: 0.15)
-                        : Colors.redAccent.withValues(alpha: 0.15),
-                    child: Icon(
-                      isMlActive ? Icons.psychology : Icons.psychology_outlined,
-                      color: isMlActive ? Colors.greenAccent : Colors.redAccent,
-                      size: 26,
-                    ),
+            // ===== ML ENGINE TOGGLE CARD =====
+            GestureDetector(
+              onTap: _toggleMlEngine,
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E1E2C),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: isMlActive
+                        ? Colors.greenAccent.withValues(alpha: 0.5)
+                        : Colors.redAccent.withValues(alpha: 0.3),
                   ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            const Text(
-                              "TFLite ML Engine",
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 15,
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                              decoration: BoxDecoration(
-                                color: isMlActive ? Colors.greenAccent : Colors.redAccent,
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                              child: Text(
-                                isMlActive ? "ACTIVE" : "INITIALIZING",
-                                style: const TextStyle(
-                                  color: Colors.black,
-                                  fontSize: 10,
+                ),
+                child: Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 22,
+                      backgroundColor: isMlActive
+                          ? Colors.greenAccent.withValues(alpha: 0.15)
+                          : Colors.redAccent.withValues(alpha: 0.15),
+                      child: Icon(
+                        isMlActive ? Icons.psychology : Icons.psychology_outlined,
+                        color: isMlActive ? Colors.greenAccent : Colors.redAccent,
+                        size: 26,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Text(
+                                "TFLite ML Engine",
+                                style: TextStyle(
+                                  color: Colors.white,
                                   fontWeight: FontWeight.bold,
+                                  fontSize: 15,
                                 ),
                               ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 4),
-                        const Text(
-                          "YAMNet Audio Classifier & Distress Sound Detection",
-                          style: TextStyle(color: Colors.white54, fontSize: 12),
-                        ),
-                      ],
+                              const SizedBox(width: 8),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 8, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: isMlActive
+                                      ? Colors.greenAccent
+                                      : Colors.redAccent,
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Text(
+                                  isMlActive
+                                      ? "ACTIVE (TAP TO PAUSE)"
+                                      : "PAUSED (TAP TO ENABLE)",
+                                  style: const TextStyle(
+                                    color: Colors.black,
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            isMlActive
+                                ? "YAMNet Audio Classifier Active (>92% threshold)"
+                                : "ML Auto-Trigger Paused",
+                            style: const TextStyle(
+                                color: Colors.white54, fontSize: 12),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
 
             const SizedBox(height: 30),
 
-            // PULSING SOS BUTTON
+            // ===== PULSING SOS BUTTON =====
             Center(
               child: Stack(
                 alignment: Alignment.center,
@@ -467,8 +624,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
                           color: isEmergency
-                              ? Colors.redAccent.withValues(alpha: 0.2 - (_pulseController.value * 0.15))
-                              : Colors.red.withValues(alpha: 0.15 - (_pulseController.value * 0.1)),
+                              ? Colors.redAccent.withValues(
+                              alpha: 0.2 - (_pulseController.value * 0.15))
+                              : Colors.red.withValues(
+                              alpha: 0.15 - (_pulseController.value * 0.1)),
                         ),
                       );
                     },
@@ -491,7 +650,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                         ? null
                         : (isCountingDown
                         ? null
-                        : () => _startCountdownWithReason("Manual SOS Button Tap")),
+                        : () => _startCountdownWithReason(
+                        "Manual SOS Button Tap")),
                     child: Container(
                       width: 165,
                       height: 165,
@@ -499,8 +659,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                         shape: BoxShape.circle,
                         gradient: LinearGradient(
                           colors: isEmergency
-                              ? [const Color(0xFFFF2A2A), const Color(0xFFB30000)]
-                              : [const Color(0xFFFF4D4D), const Color(0xFFD90429)],
+                              ? [
+                            const Color(0xFFFF2A2A),
+                            const Color(0xFFB30000)
+                          ]
+                              : [
+                            const Color(0xFFFF4D4D),
+                            const Color(0xFFD90429)
+                          ],
                           begin: Alignment.topLeft,
                           end: Alignment.bottomRight,
                         ),
@@ -514,7 +680,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       ),
                       child: Center(
                         child: isSending
-                            ? const CircularProgressIndicator(color: Colors.white, strokeWidth: 3)
+                            ? const CircularProgressIndicator(
+                            color: Colors.white, strokeWidth: 3)
                             : isCountingDown
                             ? Text(
                           "$secondsLeft",
@@ -556,19 +723,23 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
             const SizedBox(height: 24),
 
-            // BIOMETRIC CANCEL BUTTON
+            // ===== CANCEL BUTTON =====
             if (isCountingDown)
               ElevatedButton.icon(
                 icon: const Icon(Icons.fingerprint, color: Colors.white, size: 26),
                 label: const Text(
                   "CANCEL ALERT (BIOMETRIC)",
-                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 0.8),
+                  style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.8),
                 ),
                 onPressed: _cancelCountdown,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF2A2A38),
                   foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 14),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 26, vertical: 14),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(30),
                     side: const BorderSide(color: Colors.redAccent, width: 1),
@@ -577,9 +748,34 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 ),
               ),
 
+            // ===== I'M SAFE BUTTON =====
+            if (isAlertActive)
+              ElevatedButton.icon(
+                icon: const Icon(Icons.check_circle_outline,
+                    color: Colors.white, size: 26),
+                label: const Text(
+                  "I'M SAFE (RESOLVE ALERT)",
+                  style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.8),
+                ),
+                onPressed: _resolveAlert,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green[700],
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 28, vertical: 16),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(30),
+                  ),
+                  elevation: 8,
+                ),
+              ),
+
             const SizedBox(height: 30),
 
-            // QUICK SAFETY SERVICES GRID
+            // ===== SAFETY SERVICES 2×2 GRID =====
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -595,6 +791,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     ),
                   ),
                 ),
+
+                // Row 1 – Live Map + Community
                 Row(
                   children: [
                     Expanded(
@@ -602,7 +800,114 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                         onTap: () {
                           Navigator.push(
                             context,
-                            MaterialPageRoute(builder: (_) => const RideSafetyScreen()),
+                            MaterialPageRoute(
+                              builder: (_) => MapScreen(
+                                isEmergencyActive: isAlertActive,
+                                alertId: activeAlertId,
+                              ),
+                            ),
+                          );
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E1E2C),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(
+                              color: isAlertActive
+                                  ? Colors.redAccent
+                                  : Colors.white10,
+                            ),
+                          ),
+                          child: const Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              CircleAvatar(
+                                radius: 20,
+                                backgroundColor: Color(0xFF2A4A35),
+                                child: Icon(Icons.map, color: Colors.greenAccent),
+                              ),
+                              SizedBox(height: 12),
+                              Text(
+                                "Live Map",
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                "Live GPS Pin",
+                                style: TextStyle(
+                                    color: Colors.white38, fontSize: 12),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                builder: (_) => const CommunityScreen()),
+                          );
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E1E2C),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: Colors.white10),
+                          ),
+                          child: const Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              CircleAvatar(
+                                radius: 20,
+                                backgroundColor: Color(0xFF4A3A2A),
+                                child: Icon(Icons.warning_amber,
+                                    color: Colors.orangeAccent),
+                              ),
+                              SizedBox(height: 12),
+                              Text(
+                                "Community",
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                "Unsafe Zone Watch",
+                                style: TextStyle(
+                                    color: Colors.white38, fontSize: 12),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 14),
+
+                // Row 2 – Ride Safety + Guardians
+                Row(
+                  children: [
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                builder: (_) => const RideSafetyScreen()),
                           );
                         },
                         child: Container(
@@ -618,7 +923,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                               CircleAvatar(
                                 radius: 20,
                                 backgroundColor: Color(0xFF2D2A4A),
-                                child: Icon(Icons.local_taxi, color: Colors.indigoAccent),
+                                child: Icon(Icons.local_taxi,
+                                    color: Colors.indigoAccent),
                               ),
                               SizedBox(height: 12),
                               Text(
@@ -632,7 +938,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                               SizedBox(height: 4),
                               Text(
                                 "Track Taxi / Cab",
-                                style: TextStyle(color: Colors.white38, fontSize: 12),
+                                style: TextStyle(
+                                    color: Colors.white38, fontSize: 12),
                               ),
                             ],
                           ),
@@ -645,7 +952,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                         onTap: () {
                           Navigator.push(
                             context,
-                            MaterialPageRoute(builder: (_) => const ContactsScreen()),
+                            MaterialPageRoute(
+                                builder: (_) => const ContactsScreen()),
                           );
                         },
                         child: Container(
@@ -661,7 +969,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                               CircleAvatar(
                                 radius: 20,
                                 backgroundColor: Color(0xFF4A2A2D),
-                                child: Icon(Icons.people_alt, color: Colors.redAccent),
+                                child: Icon(Icons.people_alt,
+                                    color: Colors.redAccent),
                               ),
                               SizedBox(height: 12),
                               Text(
@@ -675,7 +984,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                               SizedBox(height: 4),
                               Text(
                                 "Emergency Contacts",
-                                style: TextStyle(color: Colors.white38, fontSize: 12),
+                                style: TextStyle(
+                                    color: Colors.white38, fontSize: 12),
                               ),
                             ],
                           ),

@@ -1,102 +1,49 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:vosk_flutter/vosk_flutter.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 typedef SosTriggerCallback = void Function(String reason);
 
 class VoiceDetectionService {
-  final _vosk = VoskFlutterPlugin.instance();
-  final _modelLoader = ModelLoader();
-
-  Model? _voskModel;
-  Recognizer? _recognizer;
-  SpeechService? _speechService;
-  StreamSubscription? _voskResultSub;
-  StreamSubscription? _voskPartialSub;
-
   Interpreter? _yamnetInterpreter;
   Interpreter? _classifierInterpreter;
   final AudioRecorder _audioRecorder = AudioRecorder();
+
   StreamSubscription<Uint8List>? _micSubscription;
   final List<int> _toneBufferBytes = [];
 
   static const int _sampleRate = 16000;
-  static const int _bytesPerSample = 2;
-  static const int _toneWindowBytes = _sampleRate * _bytesPerSample;
+  static const int _bytesPerSample = 2; // 16-bit PCM
+  static const int _toneWindowBytes = _sampleRate * _bytesPerSample; // ~1 second (32,000 bytes)
 
-  static const double _toneConfidenceThreshold = 0.97;
+  // Strict threshold: 92% confidence + must hold for 2 consecutive frames
+  static const double _toneConfidenceThreshold = 0.92;
   int _consecutiveHighScores = 0;
-  static const int _requiredConsecutiveFrames = 3;
+
+  // Added property for toggling on/off from UI
+  bool isEnabled = true;
 
   final SosTriggerCallback onSosTriggered;
-  final String languageCode; // 'en' or 'hi'
 
-  VoiceDetectionService({
-    required this.onSosTriggered,
-    this.languageCode = 'en',
-  });
+  VoiceDetectionService({required this.onSosTriggered});
 
-  static const Map<String, List<String>> _distressPhrases = {
-    'en': [
-      'help',
-      'help me',
-      'save me',
-      'emergency',
-      'somebody help me',
-      'someone is following me',
-      'please help me',
-      'i am in danger',
-    ],
-    'hi': [
-      'bachao',
-      'bachao mujhe',
-      'madad',
-      'mujhe bachao',
-      'koi mera peecha kar raha hai',
-      'meri madad karo',
-      'police ko bulao',
-    ],
-  };
-
+  /// Starts loading TFLite models and streaming live audio into YAMNet
   Future<void> start() async {
     try {
       var micPermission = await Permission.microphone.request();
       if (!micPermission.isGranted) {
-        print('❌ Microphone permission denied');
+        print('❌ ML Voice Service: Microphone permission denied');
         return;
       }
 
-      // 1. Initialize Vosk Speech Engine using assets from your folder structure
-      final modelAssetPath = languageCode == 'hi'
-          ? 'assets/models/vosk-model-small-hi-0.22.zip'
-          : 'assets/models/vosk-model-small-en-us-0.15.zip';
-
-      final modelPath = await _modelLoader.loadFromAssets(modelAssetPath);
-      _voskModel = await _vosk.createModel(modelPath);
-      _recognizer = await _vosk.createRecognizer(
-        model: _voskModel!,
-        sampleRate: _sampleRate,
-      );
-
-      _speechService = await _vosk.initSpeechService(_recognizer!);
-
-      _voskResultSub = _speechService!.onResult().listen((json) => _handleSpeech(json, false));
-      _voskPartialSub = _speechService!.onPartial().listen((json) => _handleSpeech(json, true));
-      await _speechService!.start();
-      print('🗣️ Vosk Speech Recognition Started ($languageCode)');
-
-      // 2. Initialize TFLite Acoustic Models
       await _loadToneModels();
+      print('🧠 ML Models Loaded Successfully: YAMNet + Distress Classifier');
 
-      // 3. Start Live Audio Stream for TFLite Scream Detection
       if (await _audioRecorder.hasPermission()) {
         final stream = await _audioRecorder.startStream(const RecordConfig(
           encoder: AudioEncoder.pcm16bits,
@@ -104,11 +51,11 @@ class VoiceDetectionService {
           numChannels: 1,
         ));
 
+        print('🎤 ML Audio Stream Started: Listening for distress tones...');
         _micSubscription = stream.listen(_onAudioChunk);
-        print('🎤 Acoustic Scream Stream Started');
       }
     } catch (e) {
-      print('❌ VoiceDetectionService Start Error: $e');
+      print('❌ ML Voice Service Start Error: $e');
     }
   }
 
@@ -131,42 +78,9 @@ class VoiceDetectionService {
     return file.path;
   }
 
-  void _handleSpeech(String jsonString, bool isPartial) {
-    try {
-      final decoded = jsonDecode(jsonString);
-      final textKey = isPartial ? 'partial' : 'text';
-      final text = (decoded[textKey] as String?)?.toLowerCase().trim() ?? '';
-      if (text.isEmpty) return;
-
-      print('📝 Vosk Heard (${isPartial ? "Partial" : "Final"}): "$text"');
-
-      // Combine BOTH English and Hindi phrases into one unified scan list
-      final allPhrases = [
-        ...(_distressPhrases['en'] ?? []),
-        ...(_distressPhrases['hi'] ?? []),
-      ];
-
-      for (final phrase in allPhrases) {
-        // 1. Direct match or substring match (e.g., "bachao mujhe" inside a sentence)
-        // 2. Component word matching for distance: if phrase has multiple words,
-        //    trigger if key strong words (length > 3) match.
-        final words = phrase.split(' ');
-        bool isMatched = text.contains(phrase) ||
-            (words.length > 1 && words.any((w) => w.length > 3 && text.contains(w))) ||
-            (words.length == 1 && text.contains(phrase));
-
-        if (isMatched) {
-          print('🚨 DUAL-LANGUAGE EMERGENCY TRIGGERED: "$phrase" found in "$text"');
-          onSosTriggered('Emergency Keyword: "$phrase"');
-          return;
-        }
-      }
-    } catch (e) {
-      print('⚠️ Speech parsing error: $e');
-    }
-  }
-
   void _onAudioChunk(Uint8List chunk) {
+    if (!isEnabled) return; // Skip processing when paused from UI
+
     _toneBufferBytes.addAll(chunk);
 
     if (_toneBufferBytes.length >= _toneWindowBytes) {
@@ -177,7 +91,7 @@ class VoiceDetectionService {
   }
 
   void _runToneClassifier(Uint8List pcmBytes) {
-    if (_yamnetInterpreter == null || _classifierInterpreter == null) return;
+    if (_yamnetInterpreter == null || _classifierInterpreter == null || !isEnabled) return;
 
     try {
       final byteData = ByteData.sublistView(pcmBytes);
@@ -224,18 +138,17 @@ class VoiceDetectionService {
       _classifierInterpreter!.run(classifierInput, classifierOutput);
 
       final double distressScore = classifierOutput[0][0];
+      print('📊 ML DISTRESS CONFIDENCE SCORE: ${distressScore.toStringAsFixed(4)} | Threshold: $_toneConfidenceThreshold');
 
       if (distressScore >= _toneConfidenceThreshold) {
         _consecutiveHighScores++;
-        if (_consecutiveHighScores >= _requiredConsecutiveFrames) {
+        if (_consecutiveHighScores >= 2) {
           _consecutiveHighScores = 0;
           print('🚨 HIGH DISTRESS SOUND CONFIRMED BY ML MODEL! (Score: $distressScore)');
-          onSosTriggered('Acoustic Scream (${(distressScore * 100).toStringAsFixed(0)}%)');
+          onSosTriggered('ML Scream Model (${(distressScore * 100).toStringAsFixed(0)}% confidence)');
         }
       } else {
-        if (_consecutiveHighScores > 0) {
-          _consecutiveHighScores--;
-        }
+        _consecutiveHighScores = 0;
       }
     } catch (e) {
       print('⚠️ ML Inference Error: $e');
@@ -246,12 +159,6 @@ class VoiceDetectionService {
     await _micSubscription?.cancel();
     await _audioRecorder.stop();
     _audioRecorder.dispose();
-    await _voskResultSub?.cancel();
-    await _voskPartialSub?.cancel();
-    await _speechService?.stop();
-    await _speechService?.dispose();
-    await _recognizer?.dispose();
-          _voskModel?.dispose();
     _yamnetInterpreter?.close();
     _classifierInterpreter?.close();
   }
