@@ -1,11 +1,11 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:permission_handler/permission_handler.dart';
 
-/// Ride safety screen: user enters driver/vehicle details, picks up to 2
-/// contacts, starts a ride. Shows a persistent notification asking whether
-/// to send the details, which stays visible (as an ongoing "ride in
-/// progress" notification) until the user ends the ride.
 class RideSafetyScreen extends StatefulWidget {
   const RideSafetyScreen({super.key});
 
@@ -14,355 +14,265 @@ class RideSafetyScreen extends StatefulWidget {
 }
 
 class _RideSafetyScreenState extends State<RideSafetyScreen> {
-  final _supabase = Supabase.instance.client;
-  final _notifications = FlutterLocalNotificationsPlugin();
-
+  final _formKey = GlobalKey<FormState>();
   final _driverNameController = TextEditingController();
-  final _driverPhoneController = TextEditingController();
   final _vehicleNumberController = TextEditingController();
-  final _vehicleModelController = TextEditingController();
+  final _cabServiceController = TextEditingController(text: "Uber / Ola");
 
-  List<Map<String, dynamic>> _contacts = [];
-  final Set<String> _selectedContactIds = {};
-  bool _loadingContacts = true;
-  bool _rideActive = false;
-  String? _activeRideId;
+  bool _isRideActive = false;
+  bool _isLoading = false;
+  String _statusMessage = "";
 
-  static const int _maxRideContacts = 2;
-  static const int _notificationId = 1001;
-
-  @override
-  void initState() {
-    super.initState();
-    _initNotifications();
-    _fetchContacts();
-  }
-
-  Future<void> _initNotifications() async {
-    const androidSettings = AndroidInitializationSettings(
-      '@mipmap/ic_launcher',
-    );
-    const settings = InitializationSettings(android: androidSettings);
-    await _notifications.initialize(
-      settings,
-      onDidReceiveNotificationResponse: _handleNotificationAction,
-    );
-  }
-
-  void _handleNotificationAction(NotificationResponse response) {
-    switch (response.actionId) {
-      case 'send_details':
-        _sendRideDetails();
-        break;
-      case 'dont_send':
-        _dismissWithoutSending();
-        break;
-      case 'end_ride':
-        _endRide();
-        break;
-    }
-  }
-
-  Future<void> _fetchContacts() async {
-    try {
-      final userId = _supabase.auth.currentUser?.id;
-      if (userId == null) return;
-
-      final response = await _supabase
-          .from('emergency_contacts')
-          .select()
-          .eq('user_id', userId);
-
-      setState(() {
-        _contacts = List<Map<String, dynamic>>.from(response);
-        _loadingContacts = false;
-      });
-    } catch (e) {
-      debugPrint('Failed to fetch contacts: $e');
-      setState(() => _loadingContacts = false);
-    }
-  }
-
-  void _toggleContact(String id) {
-    setState(() {
-      if (_selectedContactIds.contains(id)) {
-        _selectedContactIds.remove(id);
-      } else {
-        if (_selectedContactIds.length >= _maxRideContacts) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                'You can select up to $_maxRideContacts contacts only',
-              ),
-            ),
-          );
-          return;
-        }
-        _selectedContactIds.add(id);
-      }
-    });
-  }
-
-  Future<void> _startRide() async {
-    if (_driverNameController.text.trim().isEmpty ||
-        _driverPhoneController.text.trim().isEmpty ||
-        _vehicleNumberController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please fill in driver and vehicle details'),
-        ),
-      );
-      return;
-    }
-
-    if (_selectedContactIds.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select at least one contact')),
-      );
-      return;
-    }
-
-    try {
-      final userId = _supabase.auth.currentUser?.id;
-      if (userId == null) return;
-
-      final response = await _supabase
-          .from('ride_safety_shares')
-          .insert({
-            'user_id': userId,
-            'driver_name': _driverNameController.text.trim(),
-            'driver_phone': _driverPhoneController.text.trim(),
-            'vehicle_number': _vehicleNumberController.text.trim(),
-            'user_consented': false,
-          })
-          .select('id')
-          .single();
-
-      setState(() {
-        _activeRideId = response['id'] as String;
-        _rideActive = true;
-      });
-
-      await _showSendPrompt();
-    } catch (e) {
-      debugPrint('Failed to start ride: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Failed to start ride: $e')));
-      }
-    }
-  }
-
-  Future<void> _showSendPrompt() async {
-    const androidDetails = AndroidNotificationDetails(
-      'ride_safety_channel',
-      'Ride Safety',
-      channelDescription: 'Ride safety alerts and status',
-      importance: Importance.high,
-      priority: Priority.high,
-      ongoing: true, // can't be swiped away
-      autoCancel: false,
-      actions: [
-        AndroidNotificationAction('send_details', 'Send Details'),
-        AndroidNotificationAction('dont_send', 'Don\'t Send'),
-      ],
-    );
-    const details = NotificationDetails(android: androidDetails);
-
-    await _notifications.show(
-      _notificationId,
-      'Share ride details?',
-      'Send driver and vehicle info to your selected contacts?',
-      details,
-    );
-  }
-
-  Future<void> _showRideInProgressNotification() async {
-    const androidDetails = AndroidNotificationDetails(
-      'ride_safety_channel',
-      'Ride Safety',
-      channelDescription: 'Ride safety alerts and status',
-      importance: Importance.high,
-      priority: Priority.high,
-      ongoing: true,
-      autoCancel: false,
-      actions: [AndroidNotificationAction('end_ride', 'End Ride')],
-    );
-    const details = NotificationDetails(android: androidDetails);
-
-    await _notifications.show(
-      _notificationId,
-      'Ride in progress',
-      'Tap End Ride when you\'ve reached safely',
-      details,
-    );
-  }
-
-  Future<void> _sendRideDetails() async {
-    if (_activeRideId == null) return;
-
-    try {
-      final selectedContacts = _contacts
-          .where((c) => _selectedContactIds.contains(c['id']))
-          .map((c) => {'name': c['contact_name'], 'phone': c['contact_phone']})
-          .toList();
-
-      await _supabase
-          .from('ride_safety_shares')
-          .update({
-            'user_consented': true,
-            'consented_at': DateTime.now().toIso8601String(),
-            'shared_with': selectedContacts,
-          })
-          .eq('id', _activeRideId!);
-
-
-      await _showRideInProgressNotification();
-    } catch (e) {
-      debugPrint('Failed to send ride details: $e');
-    }
-  }
-
-  Future<void> _dismissWithoutSending() async {
-    await _showRideInProgressNotification();
-  }
-
-  Future<void> _endRide() async {
-    if (_activeRideId != null) {
-      await _supabase
-          .from('ride_safety_shares')
-          .update({'trip_ended_at': DateTime.now().toIso8601String()})
-          .eq('id', _activeRideId!);
-    }
-
-    await _notifications.cancel(_notificationId);
-
-    setState(() {
-      _rideActive = false;
-      _activeRideId = null;
-      _selectedContactIds.clear();
-      _driverNameController.clear();
-      _driverPhoneController.clear();
-      _vehicleNumberController.clear();
-      _vehicleModelController.clear();
-    });
-  }
+  static const _smsChannel = MethodChannel('com.example.women_safety_app/sms');
 
   @override
   void dispose() {
     _driverNameController.dispose();
-    _driverPhoneController.dispose();
     _vehicleNumberController.dispose();
-    _vehicleModelController.dispose();
+    _cabServiceController.dispose();
     super.dispose();
+  }
+
+  /// Sends initial Ride Tracking details to Guardians via Direct SMS
+  Future<void> _startRideSafety() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() {
+      _isLoading = true;
+      _statusMessage = "Getting current ride location...";
+    });
+
+    try {
+      // 1. Get GPS Location
+      Position? position;
+      try {
+        position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.medium,
+            timeLimit: Duration(seconds: 10),
+          ),
+        );
+      } catch (_) {
+        position = await Geolocator.getLastKnownPosition();
+      }
+
+      if (position == null) {
+        setState(() {
+          _isLoading = false;
+          _statusMessage = "❌ Could not get GPS location for ride start.";
+        });
+        return;
+      }
+
+      // 2. Read cached contacts
+      final prefs = await SharedPreferences.getInstance();
+      final cachedJson = prefs.getStringList('cached_emergency_contacts') ?? [];
+
+      if (cachedJson.isEmpty) {
+        setState(() {
+          _isLoading = false;
+          _statusMessage = "❌ No emergency contacts saved! Add contacts first.";
+        });
+        return;
+      }
+
+      final contacts = cachedJson
+          .map((c) => jsonDecode(c) as Map<String, dynamic>)
+          .toList();
+
+      // 3. Format Ride Safety Broadcast Message
+      final String driver = _driverNameController.text.trim();
+      final String vehicle = _vehicleNumberController.text.trim().toUpperCase();
+      final String service = _cabServiceController.text.trim();
+      final String mapsLink = 'https://maps.google.com/?q=${position.latitude},${position.longitude}';
+
+      final String message =
+          'SAFE RIDE ALERT: I am in a $service ride.\n'
+          'Vehicle No: $vehicle\n'
+          'Driver: $driver\n'
+          'Track Start Location: $mapsLink';
+
+      // 4. Request SMS permission & send direct SMS
+      var smsPermission = await Permission.sms.request();
+      if (!smsPermission.isGranted) {
+        setState(() {
+          _isLoading = false;
+          _statusMessage = "❌ SMS permission denied.";
+        });
+        return;
+      }
+
+      int sentCount = 0;
+      for (var contact in contacts) {
+        String phone = (contact['contact_phone'] ?? contact['phone'])?.toString() ?? '';
+        if (phone.isNotEmpty) {
+          try {
+            await _smsChannel.invokeMethod('sendDirectSms', {
+              'phone': phone,
+              'message': message,
+            });
+            sentCount++;
+          } catch (e) {
+            print("Failed SMS to $phone: $e");
+          }
+        }
+      }
+
+      setState(() {
+        _isRideActive = true;
+        _isLoading = false;
+        _statusMessage = "🚖 Safe Ride Active! Sent info to $sentCount guardians.";
+      });
+    } catch (e) {
+      setState(() {
+        _isLoading = false;
+        _statusMessage = "❌ Error: $e";
+      });
+    }
+  }
+
+  void _stopRideSafety() {
+    setState(() {
+      _isRideActive = false;
+      _statusMessage = "Ride ended. Safe Ride Tracking deactivated.";
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_rideActive) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Ride in Progress')),
-        body: Center(
+    return Scaffold(
+      backgroundColor: const Color(0xFF12121A),
+      appBar: AppBar(
+        title: const Text('Ride Safety Mode'),
+        backgroundColor: const Color(0xFF1E1E2C),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(24.0),
+        child: Form(
+          key: _formKey,
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(Icons.directions_car, size: 64, color: Colors.green),
-              const SizedBox(height: 16),
-              const Text('Ride is active', style: TextStyle(fontSize: 18)),
+              // HEADER CARD
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.indigoAccent.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Colors.indigoAccent.withOpacity(0.3)),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.local_taxi, color: Colors.indigoAccent, size: 32),
+                    SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        "Share cab & driver details with guardians before starting your ride.",
+                        style: TextStyle(color: Colors.white, fontSize: 14),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
               const SizedBox(height: 24),
-              ElevatedButton.icon(
-                onPressed: _endRide,
-                icon: const Icon(Icons.stop_circle),
-                label: const Text('End Ride'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.red,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 24,
-                    vertical: 14,
+
+              // CAB SERVICE FIELD
+              TextFormField(
+                controller: _cabServiceController,
+                style: const TextStyle(color: Colors.white),
+                decoration: InputDecoration(
+                  labelText: 'Cab / Ride Service',
+                  labelStyle: const TextStyle(color: Colors.white60),
+                  prefixIcon: const Icon(Icons.apps, color: Colors.indigoAccent),
+                  filled: true,
+                  fillColor: const Color(0xFF1E1E2C),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                validator: (val) => val == null || val.isEmpty ? 'Enter service (e.g. Uber/Ola)' : null,
+              ),
+
+              const SizedBox(height: 16),
+
+              // VEHICLE NUMBER FIELD
+              TextFormField(
+                controller: _vehicleNumberController,
+                style: const TextStyle(color: Colors.white),
+                textCapitalization: TextCapitalization.characters,
+                decoration: InputDecoration(
+                  labelText: 'Vehicle Number',
+                  hintText: 'e.g. UP70 AB 1234',
+                  hintStyle: const TextStyle(color: Colors.white24),
+                  labelStyle: const TextStyle(color: Colors.white60),
+                  prefixIcon: const Icon(Icons.directions_car, color: Colors.indigoAccent),
+                  filled: true,
+                  fillColor: const Color(0xFF1E1E2C),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                validator: (val) => val == null || val.isEmpty ? 'Enter vehicle plate number' : null,
+              ),
+
+              const SizedBox(height: 16),
+
+              // DRIVER NAME FIELD
+              TextFormField(
+                controller: _driverNameController,
+                style: const TextStyle(color: Colors.white),
+                decoration: InputDecoration(
+                  labelText: 'Driver Name',
+                  hintText: 'e.g. Ramesh Kumar',
+                  hintStyle: const TextStyle(color: Colors.white24),
+                  labelStyle: const TextStyle(color: Colors.white60),
+                  prefixIcon: const Icon(Icons.person, color: Colors.indigoAccent),
+                  filled: true,
+                  fillColor: const Color(0xFF1E1E2C),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                validator: (val) => val == null || val.isEmpty ? 'Enter driver name' : null,
+              ),
+
+              const SizedBox(height: 28),
+
+              // ACTION BUTTON
+              SizedBox(
+                width: double.infinity,
+                height: 54,
+                child: ElevatedButton.icon(
+                  icon: Icon(_isRideActive ? Icons.stop_circle : Icons.shield, color: Colors.white),
+                  label: _isLoading
+                      ? const CircularProgressIndicator(color: Colors.white)
+                      : Text(
+                    _isRideActive ? 'END SAFE RIDE' : 'START SAFE RIDE',
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  onPressed: _isLoading
+                      ? null
+                      : (_isRideActive ? _stopRideSafety : _startRideSafety),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isRideActive ? Colors.redAccent : Colors.indigoAccent,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   ),
                 ),
               ),
+
+              const SizedBox(height: 20),
+
+              if (_statusMessage.isNotEmpty)
+                Center(
+                  child: Text(
+                    _statusMessage,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.greenAccent,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                    ),
+                  ),
+                ),
             ],
           ),
         ),
-      );
-    }
-
-    return Scaffold(
-      appBar: AppBar(title: const Text('Ride Safety')),
-      body: _loadingContacts
-          ? const Center(child: CircularProgressIndicator())
-          : SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  TextField(
-                    controller: _driverNameController,
-                    decoration: const InputDecoration(
-                      labelText: 'Driver Name',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _driverPhoneController,
-                    keyboardType: TextInputType.phone,
-                    decoration: const InputDecoration(
-                      labelText: 'Driver Phone',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _vehicleNumberController,
-                    decoration: const InputDecoration(
-                      labelText: 'Vehicle Number',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _vehicleModelController,
-                    decoration: const InputDecoration(
-                      labelText: 'Vehicle Model (optional)',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  Text(
-                    'Select up to $_maxRideContacts contacts to share with',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 8),
-                  if (_contacts.isEmpty)
-                    const Text(
-                      'No emergency contacts saved yet. Add some in Contacts first.',
-                    )
-                  else
-                    ..._contacts.map((contact) {
-                      final id = contact['id'] as String;
-                      return CheckboxListTile(
-                        title: Text(contact['contact_name'] ?? ''),
-                        subtitle: Text(contact['contact_phone'] ?? ''),
-                        value: _selectedContactIds.contains(id),
-                        onChanged: (_) => _toggleContact(id),
-                      );
-                    }),
-                  const SizedBox(height: 20),
-                  ElevatedButton.icon(
-                    onPressed: _startRide,
-                    icon: const Icon(Icons.play_circle),
-                    label: const Text('Start Ride'),
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                    ),
-                  ),
-                ],
-              ),
-            ),
+      ),
     );
   }
 }

@@ -3,12 +3,12 @@ package com.example.women_safety_app
 import android.os.Build
 import android.telephony.SmsManager
 import androidx.annotation.NonNull
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity  // <--- Required for Biometrics (local_auth)
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.lang.Exception
 
-class MainActivity: FlutterActivity() {
+class MainActivity: FlutterFragmentActivity() {  // <--- Extends FlutterFragmentActivity
     private val channelName = "com.example.women_safety_app/sms"
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
@@ -28,7 +28,6 @@ class MainActivity: FlutterActivity() {
                             SmsManager.getDefault()
                         }
 
-                        // Send SMS directly in background
                         val parts = smsManager.divideMessage(message)
                         if (parts.size > 1) {
                             smsManager.sendMultipartTextMessage(phone, null, parts, null, null)

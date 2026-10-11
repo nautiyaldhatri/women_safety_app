@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -9,9 +10,11 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:sensors_plus/sensors_plus.dart';
 
 import 'contacts_screen.dart';
 import 'ride_safety_screen.dart';
+import 'voice_detection_service.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -20,23 +23,92 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
-  String status = "Press the button in an emergency";
+class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
+  String status = "Press button, SHAKE phone, or SCREAM in emergency";
   Timer? countdownTimer;
   int secondsLeft = 30;
   bool isCountingDown = false;
   bool isSending = false;
+  bool isMlActive = false;
 
   final LocalAuthentication _auth = LocalAuthentication();
+  late VoiceDetectionService _mlVoiceService;
+
+  StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
+  DateTime _lastShakeTime = DateTime.now();
+  late AnimationController _pulseController;
+
   static const _smsChannel = MethodChannel('com.example.women_safety_app/sms');
 
-  void _startCountdown() {
+  @override
+  void initState() {
+    super.initState();
+
+    // 1. SOS Button Pulse Animation
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
+
+    // 2. Accelerometer Shake Gesture
+    _initShakeGesture();
+
+    // 3. Start TFLite ML Voice Detection (YAMNet + Distress Classifier)
+    _initMlVoiceAssistant();
+  }
+
+  void _initShakeGesture() {
+    _accelerometerSubscription = accelerometerEventStream().listen((AccelerometerEvent event) {
+      double gForce = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
+
+      // Threshold set to 22.0 (requires an intentional, firm physical shake)
+      if (gForce > 22.0) {
+        final now = DateTime.now();
+        if (now.difference(_lastShakeTime).inSeconds > 4) {
+          _lastShakeTime = now;
+          if (!isCountingDown && !isSending) {
+            _startCountdownWithReason("Physical Phone Shake");
+          }
+        }
+      }
+    });
+  }
+
+  Future<void> _initMlVoiceAssistant() async {
+    _mlVoiceService = VoiceDetectionService(
+      onSosTriggered: (reason) {
+        if (!isCountingDown && !isSending) {
+          print('🚨 ML Model Triggered SOS: $reason');
+          _startCountdownWithReason(reason);
+        }
+      },
+    );
+    await _mlVoiceService.start();
+
+    if (mounted) {
+      setState(() {
+        isMlActive = true;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _accelerometerSubscription?.cancel();
+    _mlVoiceService.dispose();
+    countdownTimer?.cancel();
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  void _startCountdownWithReason(String reason) {
     setState(() {
       isCountingDown = true;
       secondsLeft = 30;
-      status = "Sending alert in $secondsLeft seconds...";
+      status = "ALERT TRIGGERED via [$reason]! Sending SOS in $secondsLeft seconds...";
     });
 
+    countdownTimer?.cancel();
     countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (secondsLeft <= 1) {
         timer.cancel();
@@ -47,7 +119,7 @@ class _HomeScreenState extends State<HomeScreen> {
       } else {
         setState(() {
           secondsLeft--;
-          status = "Sending alert in $secondsLeft seconds...";
+          status = "ALERT TRIGGERED via [$reason]! Sending SOS in $secondsLeft seconds...";
         });
       }
     });
@@ -63,7 +135,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       bool authenticated = await _auth.authenticate(
-        localizedReason: 'Authenticate with Fingerprint/PIN to cancel SOS alert',
+        localizedReason: 'Scan Fingerprint/PIN to cancel SOS alert',
         options: const AuthenticationOptions(
           stickyAuth: true,
           biometricOnly: false,
@@ -91,7 +163,7 @@ class _HomeScreenState extends State<HomeScreen> {
     countdownTimer?.cancel();
     setState(() {
       isCountingDown = false;
-      status = "Alert cancelled. Press the button in an emergency";
+      status = "Alert cancelled. You are safe.";
     });
   }
 
@@ -166,7 +238,7 @@ class _HomeScreenState extends State<HomeScreen> {
             .timeout(const Duration(seconds: 15));
 
         if (response.statusCode == 200) {
-          setState(() => status = "🚨 SOS Alert sent successfully!");
+          setState(() => status = "🚨 Cloud SOS Alert sent successfully!");
         } else {
           await _sendOfflineSMS(position);
         }
@@ -180,11 +252,9 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// Sends Direct SMS silently in background to each contact individually
   Future<void> _sendOfflineSMS(Position position) async {
     setState(() => status = "Offline: Requesting SMS permission...");
 
-    // Request SMS permission from Android OS
     var smsPermission = await Permission.sms.request();
     if (!smsPermission.isGranted) {
       setState(() => status = "❌ SMS Permission denied by user.");
@@ -231,121 +301,392 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
-  void dispose() {
-    countdownTimer?.cancel();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
+    bool isEmergency = isCountingDown || status.contains("ALERT") || status.contains("Broadcasted");
+
     return Scaffold(
+      backgroundColor: const Color(0xFF12121A),
       appBar: AppBar(
-        title: const Text('Women Safety App'),
-        backgroundColor: Colors.redAccent,
+        elevation: 0,
+        backgroundColor: Colors.transparent,
+        title: const Row(
+          children: [
+            Icon(Icons.shield_outlined, color: Colors.redAccent, size: 28),
+            SizedBox(width: 8),
+            Text(
+              'SAFESHE AI',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1.2,
+              ),
+            ),
+          ],
+        ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.contacts),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const ContactsScreen()),
-              );
-            },
+          Container(
+            margin: const EdgeInsets.only(right: 12),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.08),
+              shape: BoxShape.circle,
+            ),
+            child: IconButton(
+              icon: const Icon(Icons.contacts, color: Colors.white),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const ContactsScreen()),
+                );
+              },
+            ),
           ),
         ],
       ),
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text(
-                status,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20.0),
+        child: Column(
+          children: [
+            // STATUS BADGE CARD
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+              decoration: BoxDecoration(
+                color: isEmergency
+                    ? Colors.redAccent.withValues(alpha: 0.15)
+                    : Colors.greenAccent.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: isEmergency ? Colors.redAccent : Colors.greenAccent,
+                  width: 1.5,
+                ),
               ),
-              const SizedBox(height: 40),
+              child: Row(
+                children: [
+                  Icon(
+                    isEmergency ? Icons.warning_amber_rounded : Icons.check_circle_outline,
+                    color: isEmergency ? Colors.redAccent : Colors.greenAccent,
+                    size: 28,
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Text(
+                      status,
+                      style: TextStyle(
+                        color: isEmergency ? Colors.redAccent : Colors.greenAccent,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
 
-              if (!isCountingDown)
-                GestureDetector(
-                  onTap: isSending ? null : _startCountdown,
-                  child: Container(
-                    width: 180,
-                    height: 180,
-                    decoration: BoxDecoration(
-                      color: Colors.red,
-                      shape: BoxShape.circle,
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.red.withValues(alpha: 0.4),
-                          spreadRadius: 8,
-                          blurRadius: 16,
+            const SizedBox(height: 16),
+
+            // TFLite ML MODEL STATUS CARD
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E1E2C),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: isMlActive ? Colors.greenAccent.withValues(alpha: 0.5) : Colors.white10,
+                ),
+              ),
+              child: Row(
+                children: [
+                  CircleAvatar(
+                    radius: 22,
+                    backgroundColor: isMlActive
+                        ? Colors.greenAccent.withValues(alpha: 0.15)
+                        : Colors.redAccent.withValues(alpha: 0.15),
+                    child: Icon(
+                      isMlActive ? Icons.psychology : Icons.psychology_outlined,
+                      color: isMlActive ? Colors.greenAccent : Colors.redAccent,
+                      size: 26,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Text(
+                              "TFLite ML Engine",
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 15,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: isMlActive ? Colors.greenAccent : Colors.redAccent,
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text(
+                                isMlActive ? "ACTIVE" : "INITIALIZING",
+                                style: const TextStyle(
+                                  color: Colors.black,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        const Text(
+                          "YAMNet Audio Classifier & Distress Sound Detection",
+                          style: TextStyle(color: Colors.white54, fontSize: 12),
                         ),
                       ],
                     ),
-                    child: Center(
-                      child: isSending
-                          ? const CircularProgressIndicator(color: Colors.white)
-                          : const Text(
-                        "SOS",
-                        style: TextStyle(
-                          fontSize: 44,
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
+                  ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 30),
+
+            // PULSING SOS BUTTON
+            Center(
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  AnimatedBuilder(
+                    animation: _pulseController,
+                    builder: (context, child) {
+                      return Container(
+                        width: 210 + (_pulseController.value * 25),
+                        height: 210 + (_pulseController.value * 25),
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: isEmergency
+                              ? Colors.redAccent.withValues(alpha: 0.2 - (_pulseController.value * 0.15))
+                              : Colors.red.withValues(alpha: 0.15 - (_pulseController.value * 0.1)),
+                        ),
+                      );
+                    },
+                  ),
+                  AnimatedBuilder(
+                    animation: _pulseController,
+                    builder: (context, child) {
+                      return Container(
+                        width: 185 + (_pulseController.value * 12),
+                        height: 185 + (_pulseController.value * 12),
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.redAccent.withValues(alpha: 0.25),
+                        ),
+                      );
+                    },
+                  ),
+                  GestureDetector(
+                    onTap: isSending
+                        ? null
+                        : (isCountingDown
+                        ? null
+                        : () => _startCountdownWithReason("Manual SOS Button Tap")),
+                    child: Container(
+                      width: 165,
+                      height: 165,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                          colors: isEmergency
+                              ? [const Color(0xFFFF2A2A), const Color(0xFFB30000)]
+                              : [const Color(0xFFFF4D4D), const Color(0xFFD90429)],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.redAccent.withValues(alpha: 0.6),
+                            blurRadius: 28,
+                            spreadRadius: 4,
+                          ),
+                        ],
+                      ),
+                      child: Center(
+                        child: isSending
+                            ? const CircularProgressIndicator(color: Colors.white, strokeWidth: 3)
+                            : isCountingDown
+                            ? Text(
+                          "$secondsLeft",
+                          style: const TextStyle(
+                            fontSize: 60,
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        )
+                            : const Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              "SOS",
+                              style: TextStyle(
+                                fontSize: 40,
+                                color: Colors.white,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 2,
+                              ),
+                            ),
+                            Text(
+                              "PRESS TO HELP",
+                              style: TextStyle(
+                                fontSize: 9,
+                                color: Colors.white70,
+                                fontWeight: FontWeight.w600,
+                                letterSpacing: 1,
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ),
                   ),
-                ),
+                ],
+              ),
+            ),
 
-              if (isCountingDown)
-                Column(
+            const SizedBox(height: 24),
+
+            // BIOMETRIC CANCEL BUTTON
+            if (isCountingDown)
+              ElevatedButton.icon(
+                icon: const Icon(Icons.fingerprint, color: Colors.white, size: 26),
+                label: const Text(
+                  "CANCEL ALERT (BIOMETRIC)",
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 0.8),
+                ),
+                onPressed: _cancelCountdown,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2A2A38),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(30),
+                    side: const BorderSide(color: Colors.redAccent, width: 1),
+                  ),
+                  elevation: 8,
+                ),
+              ),
+
+            const SizedBox(height: 30),
+
+            // QUICK SAFETY SERVICES GRID
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.only(left: 4, bottom: 12),
+                  child: Text(
+                    "SAFETY SERVICES",
+                    style: TextStyle(
+                      color: Colors.white54,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.5,
+                    ),
+                  ),
+                ),
+                Row(
                   children: [
-                    Text(
-                      "$secondsLeft",
-                      style: const TextStyle(
-                        fontSize: 72,
-                        color: Colors.red,
-                        fontWeight: FontWeight.bold,
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (_) => const RideSafetyScreen()),
+                          );
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E1E2C),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: Colors.white10),
+                          ),
+                          child: const Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              CircleAvatar(
+                                radius: 20,
+                                backgroundColor: Color(0xFF2D2A4A),
+                                child: Icon(Icons.local_taxi, color: Colors.indigoAccent),
+                              ),
+                              SizedBox(height: 12),
+                              Text(
+                                "Ride Safety",
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                "Track Taxi / Cab",
+                                style: TextStyle(color: Colors.white38, fontSize: 12),
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     ),
-                    const SizedBox(height: 20),
-                    ElevatedButton.icon(
-                      icon: const Icon(Icons.fingerprint, color: Colors.white),
-                      label: const Text(
-                        "CANCEL ALERT",
-                        style: TextStyle(fontSize: 18, color: Colors.white),
-                      ),
-                      onPressed: _cancelCountdown,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.grey[850],
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 32,
-                          vertical: 16,
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (_) => const ContactsScreen()),
+                          );
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E1E2C),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: Colors.white10),
+                          ),
+                          child: const Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              CircleAvatar(
+                                radius: 20,
+                                backgroundColor: Color(0xFF4A2A2D),
+                                child: Icon(Icons.people_alt, color: Colors.redAccent),
+                              ),
+                              SizedBox(height: 12),
+                              Text(
+                                "Guardians",
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                "Emergency Contacts",
+                                style: TextStyle(color: Colors.white38, fontSize: 12),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
                   ],
                 ),
-
-              const SizedBox(height: 50),
-
-              TextButton.icon(
-                icon: const Icon(Icons.directions_car, color: Colors.redAccent),
-                label: const Text(
-                  "Ride Safety Mode",
-                  style: TextStyle(color: Colors.redAccent, fontSize: 16),
-                ),
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(builder: (_) => const RideSafetyScreen()),
-                  );
-                },
-              ),
-            ],
-          ),
+              ],
+            ),
+          ],
         ),
       ),
     );
